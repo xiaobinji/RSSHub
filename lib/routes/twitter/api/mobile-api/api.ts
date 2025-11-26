@@ -129,6 +129,7 @@ const listTweets = (listId, params = {}) =>
 function gatherLegacyFromData(entries, filterNested, userId) {
     const tweets = [];
     const filteredEntries = [];
+
     for (const entry of entries) {
         const entryId = entry.entryId;
         if (entryId) {
@@ -136,10 +137,12 @@ function gatherLegacyFromData(entries, filterNested, userId) {
                 filteredEntries.push(entry);
             }
             if (filterNested && filterNested.some((f) => entryId.startsWith(f))) {
+                // Expand nested conversation items (e.g., profile-conversation-* entries contain thread tweets)
                 filteredEntries.push(...entry.content.items);
             }
         }
     }
+
     for (const entry of filteredEntries) {
         if (entry.entryId) {
             const content = entry.content || entry.item;
@@ -250,10 +253,12 @@ const _getUserTweets = (id, params = {}) => cacheTryGet(id, params, getUserTweet
 const getUserTweets = async (id, params = {}) => {
     let tweets = [];
     const rest_id = await getUserID(id);
+
     await Promise.all(
         [_getUserTweets, getUserTweetsAndReplies, getUserMedia].map(async (func) => {
             try {
-                tweets.push(...(await func(id, params)));
+                const result = await func(id, params);
+                tweets.push(...result);
             } catch (error) {
                 logger.warn(`Failed to get tweets for ${id} with ${func.name}: ${error}`);
             }
@@ -268,20 +273,27 @@ const getUserTweets = async (id, params = {}) => {
             tweets = [...cacheValue, ...tweets];
         }
     }
+
     const idSet = new Set();
     tweets = tweets
         .filter(
             (tweet) =>
-                !tweet.in_reply_to_user_id_str || // exclude replies
-                tweet.in_reply_to_user_id_str === rest_id // but include replies to self (threads)
+                !tweet.in_reply_to_user_id_str || // exclude replies to others
+                tweet.in_reply_to_user_id_str === rest_id // include replies to self (threads)
         )
-        .map((tweet) => {
-            const id_str = tweet.id_str || tweet.conversation_id_str;
-            return !idSet.has(id_str) && idSet.add(id_str) && tweet;
-        }) // deduplicate
-        .filter(Boolean) // remove null
-        .toSorted((a, b) => (b.id_str || b.conversation_id_str) - (a.id_str || a.conversation_id_str)) // desc
+        .filter((tweet) => tweet.id_str) // ensure tweet has valid id_str
+        // Deduplicate by id_str only (not conversation_id_str)
+        // This preserves all tweets in a thread instead of deduping them
+        .map((tweet) => !idSet.has(tweet.id_str) && idSet.add(tweet.id_str) && tweet)
+        .filter(Boolean) // remove null from map
+        .toSorted((a, b) => {
+            // Use BigInt for safe comparison of Twitter IDs (64-bit integers)
+            const aId = BigInt(a.id_str || a.conversation_id_str || '0');
+            const bId = BigInt(b.id_str || b.conversation_id_str || '0');
+            return bId > aId ? 1 : bId < aId ? -1 : 0;
+        }) // sort descending
         .slice(0, 20);
+
     cache.set(cacheKey, JSON.stringify(tweets));
     return tweets;
 };

@@ -1,6 +1,7 @@
 import { baseUrl, gqlMap, gqlFeatures } from './constants';
 import { config } from '@/config';
 import cache from '@/utils/cache';
+import logger from '@/utils/logger';
 import { twitterGot, paginationTweets, gatherLegacyFromData } from './utils';
 import InvalidParameterError from '@/errors/types/invalid-parameter';
 import ofetch from '@/utils/ofetch';
@@ -52,7 +53,7 @@ const cacheTryGet = async (_id, params, func) => {
     return cache.tryGet(`twitter:${id}:${funcName}:${paramsString}`, () => func(id, params), config.cache.routeExpire, false);
 };
 
-const getUserTweets = (id: string, params?: Record<string, any>) =>
+const _getUserTweets = (id: string, params?: Record<string, any>) =>
     cacheTryGet(id, params, async (id, params = {}) =>
         gatherLegacyFromData(
             await paginationTweets('UserTweets', id, {
@@ -65,6 +66,76 @@ const getUserTweets = (id: string, params?: Record<string, any>) =>
             })
         )
     );
+
+const getUserTweets = async (id: string, params?: Record<string, any>) => {
+    let tweets: any[] = [];
+    const rest_id = (await getUserData(id)).data?.user?.result?.rest_id || (await getUserData(id)).data?.user_result?.result?.rest_id;
+
+    // Fetch from multiple sources like mobile-api does
+    await Promise.all(
+        [_getUserTweets, getUserMedia].map(async (func) => {
+            try {
+                const result = await func(id, params);
+                if (result) {
+                    tweets.push(...result);
+                }
+            } catch (error) {
+                logger.warn(`Failed to get tweets for ${id} with ${func.name}: ${error}`);
+            }
+        })
+    );
+
+    // Try getUserTweetsAndReplies but don't fail if it errors (404)
+    try {
+        const repliesResult = await getUserTweetsAndReplies(id, params);
+        if (repliesResult) {
+            tweets.push(...repliesResult);
+        }
+    } catch (error) {
+        logger.warn(`getUserTweetsAndReplies failed (possibly deprecated endpoint): ${error instanceof Error ? error.message : error}`);
+    }
+
+    const cacheKey = `twitter:user:tweets-cache:${rest_id}`;
+    let cacheValue = await cache.get(cacheKey);
+    if (cacheValue) {
+        try {
+            cacheValue = JSON.parse(cacheValue);
+            if (cacheValue && Array.isArray(cacheValue) && cacheValue.length) {
+                tweets = [...cacheValue, ...tweets];
+            }
+        } catch {
+            // Ignore cache parse errors
+        }
+    }
+
+    // Deduplicate and filter
+    const idSet = new Set();
+    tweets = tweets
+        .filter(
+            (tweet) =>
+                !tweet.in_reply_to_user_id_str || // exclude replies to others
+                tweet.in_reply_to_user_id_str === rest_id // include replies to self (threads)
+        )
+        .filter((tweet) => tweet?.id_str) // ensure tweet has valid id_str
+        .map((tweet) => {
+            if (!idSet.has(tweet.id_str)) {
+                idSet.add(tweet.id_str);
+                return tweet;
+            }
+            return null;
+        })
+        .filter(Boolean) // remove nulls
+        .sort((a: any, b: any) => {
+            // Use BigInt for safe comparison of Twitter IDs (64-bit integers)
+            const aId = BigInt(a.id_str || a.conversation_id_str || '0');
+            const bId = BigInt(b.id_str || b.conversation_id_str || '0');
+            return bId > aId ? 1 : bId < aId ? -1 : 0;
+        }) // sort descending
+        .slice(0, 20);
+
+    cache.set(cacheKey, JSON.stringify(tweets));
+    return tweets;
+};
 
 const getUserTweetsAndReplies = (id: string, params?: Record<string, any>) =>
     cacheTryGet(id, params, async (id, params = {}) =>

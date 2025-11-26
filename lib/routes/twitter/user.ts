@@ -70,7 +70,12 @@ async function handler(ctx) {
             data = utils.excludeRetweet(data);
         }
     } catch (error) {
-        logger.error(error);
+        const errorMessage = error instanceof Error ? error.message : String(error);
+        const errorStack = error instanceof Error ? error.stack : undefined;
+        logger.error(`Failed to fetch tweets for user ${id}: ${errorMessage}`);
+        if (errorStack) {
+            logger.debug(`Stack trace: ${errorStack}`);
+        }
     }
 
     const profileImageUrl = userInfo?.profile_image_url || userInfo?.profile_image_url_https;

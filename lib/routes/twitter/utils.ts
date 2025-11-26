@@ -4,7 +4,14 @@ import { TwitterApi } from 'twitter-api-v2';
 import { fallback, queryToBoolean, queryToInteger } from '@/utils/readable-social';
 import { parseDate } from '@/utils/parse-date';
 
-const getQueryParams = (url) => URL.parse(url, true).query;
+const getQueryParams = (url) => {
+    const urlObj = new URL(url);
+    const params = {};
+    for (const [key, value] of urlObj.searchParams.entries()) {
+        params[key] = value;
+    }
+    return params;
+};
 const getOriginalImg = (url) => {
     // https://greasyfork.org/zh-CN/scripts/2312-resize-image-on-open-image-in-new-tab/code#n150
     let m = null;
@@ -42,6 +49,57 @@ const formatText = (item) => {
         text = text.replaceAll(m.url, '');
     }
     return text.trim().replaceAll('\n', '<br>');
+};
+
+/**
+ * Merge self-reply threads into single items
+ * Uses conversation_id_str to group tweets in the same thread.
+ * All tweets in a thread share the same conversation_id_str (the ID of the root tweet).
+ * @param {Array} tweets - Array of tweet objects
+ * @returns {Array} - Array with threads merged
+ */
+const mergeThreads = (tweets) => {
+    if (!tweets || tweets.length === 0) {
+        return tweets;
+    }
+
+    // Build a map of conversation_id -> array of tweets in that conversation
+    const conversationMap = new Map();
+
+    for (const tweet of tweets) {
+        const conversationId = tweet.conversation_id_str || tweet.id_str;
+
+        if (!conversationMap.has(conversationId)) {
+            conversationMap.set(conversationId, []);
+        }
+        conversationMap.get(conversationId).push(tweet);
+    }
+
+    // Build result array: merge conversations with multiple tweets (threads)
+    const result = [];
+    for (const [, conversationTweets] of conversationMap.entries()) {
+        // Sort tweets in the conversation by creation time
+        conversationTweets.sort((a, b) => new Date(a.created_at) - new Date(b.created_at));
+
+        if (conversationTweets.length > 1) {
+            // This is a thread - merge into single item using the root tweet as base
+            const rootTweet = conversationTweets[0];
+            const mergedTweet = { ...rootTweet, _thread: conversationTweets };
+            result.push(mergedTweet);
+        } else {
+            // Single tweet, add as-is
+            result.push(conversationTweets[0]);
+        }
+    }
+
+    // Sort result by tweet ID (descending) to maintain chronological order
+    result.sort((a, b) => {
+        const aId = BigInt(a.id_str || a.conversation_id_str || '0');
+        const bId = BigInt(b.id_str || b.conversation_id_str || '0');
+        return bId > aId ? 1 : bId < aId ? -1 : 0;
+    });
+
+    return result;
 };
 
 const ProcessFeed = (ctx, { data = [] }, params = {}) => {
@@ -114,6 +172,9 @@ const ProcessFeed = (ctx, { data = [] }, params = {}) => {
         return content;
     };
 
+    // Merge threads before processing
+    data = mergeThreads(data);
+
     const formatMedia = (item) => {
         let img = '';
         if (item.extended_entities) {
@@ -151,7 +212,7 @@ const ProcessFeed = (ctx, { data = [] }, params = {}) => {
                         if (widthOfPics <= 0 && heightOfPics <= 0) {
                             content += `width="${media.sizes.large.w}" height="${media.sizes.large.h}" `;
                         }
-                        content += ` style="${style}" ` + `${readable ? 'hspace="4" vspace="8"' : ''} src="${originalImg}">`;
+                        content += ` style="${style}" ${readable ? 'hspace="4" vspace="8"' : ''} src="${originalImg}">`;
                         if (addLinkForPics) {
                             content += `</a>`;
                         }
@@ -202,9 +263,35 @@ const ProcessFeed = (ctx, { data = [] }, params = {}) => {
     return data.map((item) => {
         const originalItem = item;
         item = item.retweeted_status || item;
+
+        // Handle threads: if this item contains a thread, merge the content
+        let threadContent = '';
+        let isThread = false;
+        if (originalItem._thread && originalItem._thread.length > 1) {
+            isThread = true;
+            // Format each tweet in the thread
+            for (let i = 0; i < originalItem._thread.length; i++) {
+                const threadTweet = originalItem._thread[i];
+                threadTweet.full_text = threadTweet.full_text || threadTweet.text;
+                const formattedText = formatText(threadTweet);
+                const threadMedia = formatMedia(threadTweet);
+
+                if (i > 0) {
+                    threadContent += readable ? `<hr style='margin: 10px 0; border: none; border-top: 1px solid #e1e8ed;'>` : '<br><br>';
+                }
+                threadContent += `<div class="thread-tweet">`;
+                if (readable && originalItem._thread.length > 2) {
+                    threadContent += `<small style='color: #657786;'>${i + 1}/${originalItem._thread.length}</small><br>`;
+                }
+                threadContent += formattedText;
+                threadContent += threadMedia;
+                threadContent += `</div>`;
+            }
+        }
+
         item.full_text = item.full_text || item.text;
         item.full_text = formatText(item);
-        const img = formatMedia(item);
+        const img = isThread ? '' : formatMedia(item); // Don't duplicate media if it's a thread
         let picsPrefix = generatePicsPrefix(item);
         let quote = '';
         let quoteInTitle = '';
@@ -285,7 +372,9 @@ const ProcessFeed = (ctx, { data = [] }, params = {}) => {
         const isRetweet = originalItem !== item;
         const isQuote = item.is_quote_status;
         if (!isRetweet && (!isQuote || showRetweetTextInTitle)) {
-            if (item.in_reply_to_screen_name) {
+            if (isThread) {
+                title += '🧵 ';
+            } else if (item.in_reply_to_screen_name) {
                 title += showEmojiForRetweetAndReply ? '↩️ ' : showSymbolForRetweetAndReply ? 'Re ' : '';
             }
             title += replaceBreak(originalItem.full_text);
@@ -372,14 +461,33 @@ const ProcessFeed = (ctx, { data = [] }, params = {}) => {
             }
             description += `:&ensp;`;
         }
-        if (item.in_reply_to_screen_name) {
+        if (item.in_reply_to_screen_name && !isThread) {
             description += showEmojiForRetweetAndReply ? '↩️ ' : showSymbolForRetweetAndReply ? 'Re ' : '';
         }
 
-        description += item.full_text;
+        // Use thread content if this is a thread, otherwise use normal content
+        if (isThread) {
+            if (readable) {
+                description += `<div style='background: #f7f9fa; padding: 10px; border-radius: 8px; border-left: 3px solid #1da1f2;'>`;
+                description += `<small style='color: #1da1f2; font-weight: bold;'>🧵 Thread (${originalItem._thread.length} tweets)</small><br><br>`;
+            }
+            description += threadContent;
+            if (readable) {
+                description += `</div>`;
+            }
+        } else {
+            description += item.full_text;
+            description += img;
+        }
+
+        // Add original tweet link for retweets
+        if (isRetweet && readable) {
+            const originalTweetLink = `https://x.com/${item.user?.screen_name}/status/${item.id_str || item.conversation_id_str}`;
+            description += `<br><small>Original tweet: <a href='${originalTweetLink}' target='_blank' rel='noopener noreferrer'>${originalTweetLink}</a></small>`;
+        }
+
         // 从 description 提取 话题作为 category，放在此处是为了避免 匹配到 quote 中的 # 80808030 颜色字符
         const category = description.match(/(\s)?(#[^\s;<]+)/g)?.map((e) => e?.match(/#([^\s<]+)/)?.[1]);
-        description += img;
         description += quote;
         if (readable) {
             description += `<br clear='both' /><div style='clear: both'></div>`;
