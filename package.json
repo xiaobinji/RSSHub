@@ -212,7 +212,6 @@
     },
     "pnpm": {
         "onlyBuiltDependencies": [
-            "bufferutil",
             "core-js",
             "es5-ext",
             "esbuild",
@@ -223,7 +222,6 @@
             "rebrowser-puppeteer",
             "rolldown",
             "sleep",
-            "utf-8-validate",
             "vue-demi"
         ],
         "overrides": {

@@ -24,7 +24,7 @@ COPY ./package.json /app/
 RUN \
     set -ex && \
     export PUPPETEER_SKIP_DOWNLOAD=true && \
-    pnpm install --frozen-lockfile --no-optional && \
+    pnpm install --frozen-lockfile && \
     pnpm rb
 
 # ---------------------------------------------------------------------------------------------------------------------
