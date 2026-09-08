@@ -54432,7 +54432,8 @@ export default {
       "/:section?/:type?/:user?": {
         "path": "/:section?/:type?/:user?",
         "categories": [
-          "programming"
+          "programming",
+          "popular"
         ],
         "view": 0,
         "example": "/hackernews/threads/comments_list/dang",
